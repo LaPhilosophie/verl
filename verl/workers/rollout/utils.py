@@ -21,6 +21,7 @@ import uvicorn
 import yaml
 from fastapi import FastAPI
 
+from verl.utils.tokenizer import get_processor_token_id
 from verl.workers.config.rollout import PrometheusConfig
 
 logger = logging.getLogger(__file__)
@@ -113,9 +114,54 @@ def qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
         return prompt_ids
 
 
+def get_vision_placeholder_token_ids(processor) -> list[int]:
+    """Vision placeholder token ids the policy must never sample.
+
+    An `<|image_pad|>` or `<|video_pad|>` token only means something when a real image or video
+    sits behind it: the k-th run of placeholders pairs with the k-th row of `image_grid_thw` /
+    `video_grid_thw`. Nothing stops the policy from sampling one anyway -- it is an ordinary entry
+    of the vocabulary -- and then that pairing silently breaks. Every downstream consumer trusts
+    it, so each one has its own way of dying: `get_rope_index` walks off the end of the grid
+    iterator, and `merge_multimodal_embeddings` scatters into a mask that no longer matches the
+    embedding count. Both take the whole training job down with them.
+
+    A tool that returns an image is unaffected: that image arrives in the next turn's prompt, not
+    in what the model generates.
+
+    Returns an empty list for text-only models, leaving sampling untouched.
+    """
+    token_ids = []
+    for modality in ("image", "video"):
+        token_id = get_processor_token_id(processor, modality)
+        if token_id is not None:
+            token_ids.append(token_id)
+    return token_ids
+
+
+def _get_rollout_targets(config_file: str, server_addresses: list[str]) -> list[str]:
+    """Merge new rollout server addresses into the existing Prometheus rollout targets."""
+    try:
+        with open(config_file) as f:
+            existing_config = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        existing_config = {}
+
+    existing_targets: list[str] = []
+    if isinstance(existing_config, dict):
+        for scrape_config in existing_config.get("scrape_configs", []):
+            if not isinstance(scrape_config, dict) or scrape_config.get("job_name") != "rollout":
+                continue
+            for static_config in scrape_config.get("static_configs", []):
+                if isinstance(static_config, dict):
+                    existing_targets.extend(static_config.get("targets", []))
+
+    return list(dict.fromkeys([*existing_targets, *server_addresses]))
+
+
 def update_prometheus_config(config: PrometheusConfig, server_addresses: list[str], rollout_name: str | None = None):
     """
     Update Prometheus configuration file with server addresses and reload on first node.
+    Existing rollout targets in the configuration file are preserved.
 
     server_addresses: vllm or sglang server addresses
 
@@ -128,6 +174,7 @@ def update_prometheus_config(config: PrometheusConfig, server_addresses: list[st
 
     try:
         # Get Prometheus config file path from environment or use default
+        rollout_targets = _get_rollout_targets(config.file, server_addresses)
         prometheus_config_json = {
             "global": {"scrape_interval": "10s", "evaluation_interval": "10s"},
             "scrape_configs": [
@@ -135,7 +182,7 @@ def update_prometheus_config(config: PrometheusConfig, server_addresses: list[st
                     "job_name": "ray",
                     "file_sd_configs": [{"files": ["/tmp/ray/prom_metrics_service_discovery.json"]}],
                 },
-                {"job_name": "rollout", "static_configs": [{"targets": server_addresses}]},
+                {"job_name": "rollout", "static_configs": [{"targets": rollout_targets}]},
             ],
         }
 
